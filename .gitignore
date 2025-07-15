@@ -1,0 +1,45 @@
+# Trae AI
+.trae/
+
+# JetBrains IDEs
+.idea/
+*.iml
+*.iws
+*.ipr
+.idea_modules/
+out/
+
+# VSCode
+.vscode/
+*.code-workspace
+.history/
+
+# Go specific
+/bin/
+/pkg/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+
+# Output files from this project
+taric_codes.txt
+taric_codes.csv
+taric_codes_full.csv
+
+# OS specific
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+taric_codes.txt
+taric_codes.csv
+taric_codes_full.csv
