@@ -15,10 +15,10 @@ This Go application retrieves TARIC (Integrated Tariff of the European Communiti
 
 ## Usage
 
-Simply run the compiled binary:
+Simply run main.go:
 
 ```bash
-./taric-scraper
+go run main.go
 ```
 
 The application will:
