@@ -9,19 +9,22 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
 	baseURL    = "https://www.trade-tariff.service.gov.uk/api/v2"
 	outputFile = "taric_codes_full.csv"
-	maxWorkers = 15 // Riduciamo leggermente i workers
+	maxWorkers = 25
 	apiTimeout = 30 * time.Second
-	maxRetries = 4                      // Numero massimo di tentativi per richiesta
-	rateLimit  = 150 * time.Millisecond // Pausa tra le richieste (circa 6-7 rich/sec)
+	rateLimit  = 150 * time.Millisecond
+	maxRetries = 4
 )
 
+// Structs per il JSON (invariate)
 type Attributes struct {
 	GoodsNomenclatureItemID string `json:"goods_nomenclature_item_id"`
 	Description             string `json:"description"`
@@ -50,7 +53,7 @@ type TaricEntry struct {
 
 var (
 	httpClient  = &http.Client{Timeout: apiTimeout}
-	rateLimiter = time.NewTicker(rateLimit) // Il nostro regolatore di flusso
+	rateLimiter = time.NewTicker(rateLimit)
 )
 
 func makeAPIRequest(url string) ([]byte, error) {
@@ -58,7 +61,7 @@ func makeAPIRequest(url string) ([]byte, error) {
 	var err error
 
 	for i := 0; i < maxRetries; i++ {
-		<-rateLimiter.C // Aspetta il "via libera" dal regolatore
+		<-rateLimiter.C
 
 		req, reqErr := http.NewRequest(http.MethodGet, url, nil)
 		if reqErr != nil {
@@ -68,18 +71,18 @@ func makeAPIRequest(url string) ([]byte, error) {
 
 		res, doErr := httpClient.Do(req)
 		if doErr != nil {
-			err = fmt.Errorf("errore nella richiesta a %s: %w", url, doErr)
-			continue // Riprova in caso di errore di rete
+			err = fmt.Errorf("errore di rete per %s: %w", url, doErr)
+			time.Sleep(time.Duration(1<<i) * time.Second)
+			continue
 		}
 
-		// Gestione del Rate Limit (429) e altri errori server
 		if res.StatusCode == http.StatusTooManyRequests || res.StatusCode >= 500 {
-			backoff := time.Duration(1<<i) * time.Second // 1s, 2s, 4s, 8s
+			backoff := time.Duration(1<<i) * time.Second
 			log.Printf("Errore %d per %s. Attendo %v e riprovo...", res.StatusCode, url, backoff)
 			time.Sleep(backoff)
 			err = fmt.Errorf("risposta non valida dopo %d tentativi: status %d", i+1, res.StatusCode)
 			res.Body.Close()
-			continue // Riprova
+			continue
 		}
 
 		if res.StatusCode != http.StatusOK {
@@ -92,9 +95,9 @@ func makeAPIRequest(url string) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("errore nella lettura della risposta: %w", err)
 		}
-		return body, nil // Successo
+		return body, nil
 	}
-	return nil, err // Tutti i tentativi sono falliti
+	return nil, err
 }
 
 func findDeclarableCommodities(commodityCode string, visited map[string]bool, finalEntries *[]TaricEntry) {
@@ -111,7 +114,6 @@ func findDeclarableCommodities(commodityCode string, visited map[string]bool, fi
 	url := fmt.Sprintf("%s/%s/%s", baseURL, endpointType, commodityCode)
 	body, err := makeAPIRequest(url)
 	if err != nil {
-		// Non usiamo log.Printf qui perché makeAPIRequest ha già gestito i tentativi
 		return
 	}
 
@@ -122,7 +124,6 @@ func findDeclarableCommodities(commodityCode string, visited map[string]bool, fi
 	}
 
 	if response.Data.Attributes.Declarable {
-		fmt.Printf("Trovato codice finale: %s\n", response.Data.Attributes.GoodsNomenclatureItemID)
 		*finalEntries = append(*finalEntries, TaricEntry{
 			Code:        response.Data.Attributes.GoodsNomenclatureItemID,
 			Description: response.Data.Attributes.Description,
@@ -138,17 +139,26 @@ func findDeclarableCommodities(commodityCode string, visited map[string]bool, fi
 	}
 }
 
+// La funzione worker ora non stampa più nulla
 func processChapter(chapterID string) []TaricEntry {
-	fmt.Printf("== Inizio analisi del Capitolo %s ==\n", chapterID)
 	var finalEntries []TaricEntry
 	visited := make(map[string]bool)
 	findDeclarableCommodities(chapterID, visited, &finalEntries)
-	fmt.Printf("== Capitolo %s completato. Trovati %d codici finali. ==\n", chapterID, len(finalEntries))
 	return finalEntries
 }
 
+// Funzione per disegnare la barra del progresso
+func printProgressBar(completed, total int) {
+	barWidth := 50
+	percent := float64(completed) / float64(total)
+	filledWidth := int(float64(barWidth) * percent)
+
+	bar := strings.Repeat("=", filledWidth) + ">" + strings.Repeat(" ", barWidth-filledWidth)
+	fmt.Printf("\r[%s] %d/%d (%.0f%%)", bar, completed, total, percent*100)
+}
+
 func main() {
-	defer rateLimiter.Stop() // Pulisce il ticker alla fine
+	defer rateLimiter.Stop()
 
 	fmt.Println("Recupero la lista dei capitoli...")
 	chapterListBody, err := makeAPIRequest(baseURL + "/chapters")
@@ -166,45 +176,74 @@ func main() {
 		chapterIDs = append(chapterIDs, chap.Attributes.GoodsNomenclatureItemID[:2])
 	}
 
+	totalChapters := len(chapterIDs)
+	var completedChapters int32 = 0
+
+	jobs := make(chan string, totalChapters)
+	resultsChan := make(chan []TaricEntry, totalChapters)
+
+	// Lancia la goroutine per la barra del progresso
+	done := make(chan bool)
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				// Legge il contatore in modo atomico/sicuro
+				completed := atomic.LoadInt32(&completedChapters)
+				printProgressBar(int(completed), totalChapters)
+			}
+		}
+	}()
+
 	var wg sync.WaitGroup
-	resultsChan := make(chan []TaricEntry, len(chapterIDs))
-
-	fmt.Printf("Avvio del processo parallelo con %d workers...\n", maxWorkers)
-
 	for i := 0; i < maxWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for _, id := range chapterIDs[i*len(chapterIDs)/maxWorkers : (i+1)*len(chapterIDs)/maxWorkers] {
-				resultsChan <- processChapter(id)
+			for chapterID := range jobs {
+				// Il worker processa il capitolo...
+				result := processChapter(chapterID)
+				// ...invia il risultato...
+				resultsChan <- result
+				// ...e infine incrementa il contatore.
+				atomic.AddInt32(&completedChapters, 1)
 			}
 		}()
 	}
 
-	// Bilanciamo il carico per i capitoli rimanenti
-	remaining := len(chapterIDs) % maxWorkers
-	if remaining > 0 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for _, id := range chapterIDs[len(chapterIDs)-remaining:] {
-				resultsChan <- processChapter(id)
-			}
-		}()
-	}
+	fmt.Printf("Avvio del processo di analisi con %d workers...\n", maxWorkers)
 
+	for _, id := range chapterIDs {
+		jobs <- id
+	}
+	close(jobs)
+
+	// Goroutine per attendere che i risultati vengano raccolti
+	var collectWg sync.WaitGroup
+	collectWg.Add(1)
+	var allFoundEntries []TaricEntry
 	go func() {
-		wg.Wait()
-		close(resultsChan)
+		defer collectWg.Done()
+		for entries := range resultsChan {
+			if entries != nil {
+				allFoundEntries = append(allFoundEntries, entries...)
+			}
+		}
 	}()
 
-	var allFoundEntries []TaricEntry
-	for entries := range resultsChan {
-		if entries != nil {
-			allFoundEntries = append(allFoundEntries, entries...)
-		}
-	}
+	wg.Wait()
+	close(resultsChan)
+	collectWg.Wait()
 
+	// Ferma la goroutine della barra del progresso
+	done <- true
+
+	// Assicura che l'ultima versione della barra sia stampata al 100%
+	printProgressBar(totalChapters, totalChapters)
 	fmt.Println("\nProcesso di download completato. Scrittura del file...")
 
 	seen := make(map[string]bool)
